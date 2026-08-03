@@ -1,4 +1,7 @@
 (* main.ml *)
+(* 优化开关：默认关闭；只有显式传入 -opt 才启用优化通道 *)
+let optimize_enabled = Array.exists (fun a -> a = "-opt") Sys.argv
+
 let () =
   try
     (* 1. 从标准输入读取 ToyC 源代码 *)
@@ -7,7 +10,7 @@ let () =
     (* 2. 词法与语法分析 *)
     let ast = Lib.Parser.prog Lib.Lexer.token lexbuf in
     
-    (* 【修改】注释掉 AST 调试输出，不让它污染标准输出 *)
+    (* 注释掉 AST 调试输出，不让它污染标准输出 *)
     (* Lib.Ast.dump_ast ast; *)
 
     (* 3. 语义分析与 IR 生成 *)
@@ -19,16 +22,15 @@ let () =
         exit 1
 
     | Ok ir ->
-        (* 【修改】注释掉原本的 IR 打印和成功提示 *)
-        (* Printf.printf "Semantic check success!\n"; *)
-        (* Lib.Ir.dump_ir ir *)
+        (* 在代码生成前运行优化通道：
+           常量折叠 -> 尾递归 -> 死代码消除 *)
+        let ir =
+          if optimize_enabled then Lib.Optimize.optimize_program ir else ir
+        in
         
-        (* 【关键】直接调用汇编代码生成器，将 RV32I 汇编流打印到标准输出 *)
+        (* 调用汇编代码生成器，将 RV32I 汇编流打印到标准输出 *)
         Lib.Codegen.generate_riscv ir
     );
-
-    (* 【修改】注释掉尾部的统计信息，保持汇编文件纯净 *)
-    (* Printf.printf "Success: Units parsed: %d\n" (List.length ast) *)
 
   with
   | Lib.Lexer.Error msg ->

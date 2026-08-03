@@ -1,6 +1,6 @@
 (library
  (name lib)
- (modules ast lexer parser semantic ir codegen)
+ (modules ast lexer parser semantic ir optimize codegen)
 )
 
 (ocamllex lexer)

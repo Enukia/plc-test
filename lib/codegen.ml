@@ -345,6 +345,11 @@ let emit_function (f: ir_func) =
       let off = Hashtbl.find map (Var name) in
       Printf.printf "    sw a%d, %d(fp)\n" i off
   ) f.params;
+
+  (* 打印函数入口标签：尾递归优化会跳回该标签。
+     未优化（-O0）时入口标签统一为 "entry"，无需打印，保持原输出。 *)
+  if f.entry.label <> "entry" then
+    Printf.printf "%s:\n" f.entry.label;
   
   (* 函数体翻译 (Body) *)
   let current_args = ref [] in
