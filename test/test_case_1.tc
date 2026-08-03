@@ -1,0 +1,16 @@
+const int LIMIT = 500;
+int counter = 0;
+
+void add_one() {
+    counter = counter + 1;
+}
+
+int main() {
+    int x = 10;
+    {
+        int x = 20; // 局部遮蔽全局
+        counter = x + LIMIT;
+    }
+    add_one();
+    return counter;
+}

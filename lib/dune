@@ -1,0 +1,7 @@
+(library
+ (name lib)
+ (modules ast lexer parser semantic ir codegen)
+)
+
+(ocamllex lexer)
+(menhir (modules parser))
