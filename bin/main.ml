@@ -1,6 +1,6 @@
 (* main.ml *)
-(* 优化开关：默认关闭；只有显式传入 -opt 才启用优化通道 *)
-let optimize_enabled = Array.exists (fun a -> a = "-opt") Sys.argv
+(* 优化开关：默认开启；-O0 可关闭，便于与未优化版本对比/回归 *)
+let optimize_enabled = not (Array.exists (fun a -> a = "-O0") Sys.argv)
 
 let () =
   try
