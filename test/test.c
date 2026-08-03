@@ -1,1 +1,9 @@
-int square(int x) { return x * x; } int main() { int a = 5; return square(a); }
+void foo() {
+    int x = 1;
+    int y = x + 2;
+}
+
+int main() {
+    return 1;
+    foo();
+}
