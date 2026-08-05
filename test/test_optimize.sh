@@ -6,6 +6,14 @@ set +e
 
 cd "$(dirname "$0")/.." || exit 1
 COMPILER="$(pwd)/_build/default/bin/main.exe"
+if command -v dune >/dev/null 2>&1; then
+    DUNE_CMD=(dune)
+elif command -v opam >/dev/null 2>&1; then
+    DUNE_CMD=(opam exec -- dune)
+else
+    echo "Error: dune not found. Run this script inside an opam shell, or install dune." >&2
+    exit 1
+fi
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -16,7 +24,7 @@ FAIL=0
 TOTAL=0
 
 echo "Building project..."
-dune build || exit 1
+"${DUNE_CMD[@]}" build || exit 1
 
 check() {
     local desc="$1" code="$2" must="$3" mustnot="$4"
@@ -62,6 +70,38 @@ check "dead local chain removed" \
 check "while(0) body removed" \
     'void foo() {} int main() { while (0) { foo(); } return 0; }' \
     'li a0, 0' 'call foo'
+
+echo ""
+echo "========== COPY PROPAGATION =========="
+
+check "parameter copy chain collapsed" \
+    'int id(int x) { int a = x; int b = a; return b; } int main() { return id(7); }' \
+    'lw a0, -12(fp)' '\-16(fp)'
+
+echo ""
+echo "========== COMMON SUBEXPRESSION =========="
+
+TOTAL=$((TOTAL + 1))
+cse_out=$(printf '%s' \
+    'int f(int a, int b) { int x = a * b; int y = a * b; return x + y; } int main() { return f(6, 7); }' \
+    | "$COMPILER" -opt 2>&1)
+f_body=$(printf '%s' "$cse_out" | awk '/^f:/,/^\.L_epilogue_f:/')
+mul_count=$(printf '%s' "$f_body" | grep -c '^\.L_mul_loop')
+if [ "$mul_count" -eq 1 ]; then
+    echo -e "${GREEN}PASS${NC}: repeated multiply computed once"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}FAIL${NC}: repeated multiply computed once"
+    echo "$f_body" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+fi
+
+echo ""
+echo "========== ALGEBRAIC SIMPLIFICATION =========="
+
+check "x*2 and x*0 avoid multiply helper" \
+    'int f(int x) { return x * 2 + x * 0; } int main() { return f(9); }' \
+    'add t0, t0, t1' '\.L_mul_loop'
 
 echo ""
 echo "========== TAIL RECURSION =========="

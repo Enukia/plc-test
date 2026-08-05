@@ -87,6 +87,169 @@ let fold_unop op a =
   | Ast.Neg -> Some (wrap32 (-a))
   | Ast.Not -> Some (if a = 0 then 1 else 0)
 
+let is_commutative = Ast.(function
+  | Add | Mul | Eq | Ne | And | Or -> true
+  | Sub | Div | Mod | Lt | Gt | Le | Ge -> false)
+
+let operand_repr = function
+  | Const n -> "C" ^ string_of_int n
+  | Temp t -> "T" ^ string_of_int t
+  | Var v -> "V" ^ v
+
+let binop_repr = Ast.(function
+  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
+  | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Le -> "<=" | Ge -> ">="
+  | And -> "&&" | Or -> "||")
+
+let unop_repr = Ast.(function
+  | Pos -> "+" | Neg -> "-" | Not -> "!")
+
+let expr_key op a b =
+  let ra = operand_repr a and rb = operand_repr b in
+  let x, y =
+    if is_commutative op && String.compare rb ra < 0 then rb, ra else ra, rb
+  in
+  "B" ^ binop_repr op ^ "(" ^ x ^ "," ^ y ^ ")"
+
+let unexpr_key op a =
+  "U" ^ unop_repr op ^ "(" ^ operand_repr a ^ ")"
+
+let depends_on_key k = function
+  | Const _ -> false
+  | (Temp _ | Var _) as o -> op_key o = Some k
+
+let operand_is_local = function
+  | Temp _ -> true
+  | Var v -> String.contains v '$'
+  | Const _ -> false
+
+let subst_copy env o =
+  let rec go seen o =
+    match op_key o with
+    | None -> o
+    | Some k when List.mem k seen -> o
+    | Some k ->
+        (match List.assoc_opt k env with
+         | Some o' -> go (k :: seen) o'
+         | None -> o)
+  in
+  go [] o
+
+let invalidate_copy d env =
+  match op_key d with
+  | None -> env
+  | Some k ->
+      List.filter
+        (fun (dst, src) -> dst <> k && not (depends_on_key k src))
+        env
+
+(* Copy propagation within each basic block.  This mostly targets p03-style
+   chains such as a=b; c=a; return c, and it deliberately forgets facts at
+   labels and calls. *)
+let copy_prop (instrs: tac list) : tac list =
+  let env = ref [] in
+  let set d s =
+    match op_key d with
+    | Some k when d <> s -> env := (k, s) :: List.remove_assoc k !env
+    | _ -> ()
+  in
+  let kill d = env := invalidate_copy d !env in
+  let clear () = env := [] in
+  let out = ref [] in
+  let emit i = out := i :: !out in
+  List.iter (fun i ->
+    match i with
+    | Assign (d, s) ->
+        let s' = subst_copy !env s in
+        kill d;
+        if d <> s' then (
+          emit (Assign (d, s'));
+          set d s')
+    | AssignBinOp (d, op, a, b) ->
+        let a' = subst_copy !env a and b' = subst_copy !env b in
+        kill d;
+        emit (AssignBinOp (d, op, a', b'))
+    | AssignUnOp (d, op, a) ->
+        let a' = subst_copy !env a in
+        kill d;
+        emit (AssignUnOp (d, op, a'))
+    | IfGoto (a, l) -> emit (IfGoto (subst_copy !env a, l))
+    | IfNotGoto (a, l) -> emit (IfNotGoto (subst_copy !env a, l))
+    | Param a -> emit (Param (subst_copy !env a))
+    | Call (d, fname, n) ->
+        emit (Call (d, fname, n));
+        env := List.filter (fun (k, _) -> String.length k = 0 || k.[0] <> 'V') !env;
+        kill d
+    | Return (Some a) -> emit (Return (Some (subst_copy !env a)))
+    | Label l -> emit (Label l); clear ()
+    | Goto l -> emit (Goto l)
+    | Return None -> emit (Return None)
+  ) instrs;
+  List.rev !out
+
+type available_expr = {
+  ekey: string;
+  result: operand;
+  deps: operand list;
+}
+
+let invalidate_exprs d env =
+  match op_key d with
+  | None -> env
+  | Some k ->
+      List.filter
+        (fun e ->
+          op_key e.result <> Some k
+          && not (List.exists (depends_on_key k) e.deps))
+        env
+
+let find_expr k env =
+  match List.find_opt (fun e -> e.ekey = k) env with
+  | Some e -> Some e.result
+  | None -> None
+
+let record_expr k d deps env =
+  if operand_is_local d then { ekey = k; result = d; deps } :: List.filter (fun e -> e.ekey <> k) env
+  else env
+
+(* Local common subexpression elimination.  It catches repeated pure TAC
+   expressions inside a basic block, for example a*b computed twice before
+   either a or b changes. *)
+let common_subexpr (instrs: tac list) : tac list =
+  let env = ref [] in
+  let out = ref [] in
+  let emit i = out := i :: !out in
+  let clear () = env := [] in
+  List.iter (fun i ->
+    match i with
+    | Assign (d, s) ->
+        env := invalidate_exprs d !env;
+        if d <> s then emit i
+    | AssignBinOp (d, op, a, b) ->
+        env := invalidate_exprs d !env;
+        let k = expr_key op a b in
+        (match find_expr k !env with
+         | Some prev -> emit (Assign (d, prev))
+         | None ->
+             emit i;
+             env := record_expr k d [a; b] !env)
+    | AssignUnOp (d, op, a) ->
+        env := invalidate_exprs d !env;
+        let k = unexpr_key op a in
+        (match find_expr k !env with
+         | Some prev -> emit (Assign (d, prev))
+         | None ->
+             emit i;
+             env := record_expr k d [a] !env)
+    | Call (d, fname, n) ->
+        emit (Call (d, fname, n));
+        clear ();
+        env := invalidate_exprs d !env
+    | Label l -> emit (Label l); clear ()
+    | _ -> emit i
+  ) instrs;
+  List.rev !out
+
 (* 常量折叠 + 基本块内常量传播 + 代数化简。
  * 每个 Label 处清空已知值（块间不做跨路径传播，保证安全）。 *)
 let const_fold (instrs: tac list) : tac list =
@@ -174,6 +337,37 @@ let const_fold (instrs: tac list) : tac list =
     | Return None -> emit (Return None)
   ) instrs;
   List.rev !out
+
+(* Extra algebraic simplification that can rewrite one TAC instruction into
+   another operation, not just into a single operand. *)
+let algebra_simplify (instrs: tac list) : tac list =
+  List.map (function
+    | AssignBinOp (d, Ast.Mul, x, Const 2)
+    | AssignBinOp (d, Ast.Mul, Const 2, x) ->
+        AssignBinOp (d, Ast.Add, x, x)
+    | AssignBinOp (d, Ast.Mul, x, Const (-1))
+    | AssignBinOp (d, Ast.Mul, Const (-1), x) ->
+        AssignUnOp (d, Ast.Neg, x)
+    | AssignBinOp (d, Ast.Div, Const 0, _) ->
+        Assign (d, Const 0)
+    | AssignBinOp (d, Ast.Mod, Const 0, _) ->
+        Assign (d, Const 0)
+    | AssignBinOp (d, Ast.And, Const 0, _)
+    | AssignBinOp (d, Ast.And, _, Const 0) ->
+        Assign (d, Const 0)
+    | AssignBinOp (d, Ast.And, Const n, x) when n <> 0 ->
+        Assign (d, x)
+    | AssignBinOp (d, Ast.And, x, Const n) when n <> 0 ->
+        Assign (d, x)
+    | AssignBinOp (d, Ast.Or, Const n, _) when n <> 0 ->
+        Assign (d, Const 1)
+    | AssignBinOp (d, Ast.Or, _, Const n) when n <> 0 ->
+        Assign (d, Const 1)
+    | AssignBinOp (d, Ast.Or, Const 0, x)
+    | AssignBinOp (d, Ast.Or, x, Const 0) ->
+        Assign (d, x)
+    | i -> i
+  ) instrs
 
 (* ---------- 尾递归优化 ---------- *)
 
@@ -486,15 +680,33 @@ let shrink_func (f: ir_func) : ir_func =
 
 (* ---------- 主流程 ---------- *)
 
+let optimize_linear instrs =
+  instrs
+  |> const_fold
+  |> algebra_simplify
+  |> copy_prop
+  |> common_subexpr
+  |> copy_prop
+  |> const_fold
+  |> algebra_simplify
+
+let rec repeat_linear n instrs =
+  if n <= 0 then instrs
+  else
+    let instrs' = optimize_linear instrs in
+    if instrs' = instrs then instrs else repeat_linear (n - 1) instrs'
+
 let optimize_func (f: ir_func) : ir_func =
   let instrs = flatten_func f in
   let f, instrs = normalize_entry f instrs in
-  let instrs = const_fold instrs in
+  let instrs = repeat_linear 3 instrs in
   let instrs = tail_recursion f instrs in
-  let instrs = const_fold instrs in
+  let instrs = repeat_linear 3 instrs in
   let f = rebuild_func f instrs in
   let f = truncate_func f in
   let f = remove_unreachable_blocks f in
+  let f = dce f in
+  let f = rebuild_func f (repeat_linear 2 (flatten_func f)) in
   let f = dce f in
   let f = merge_empty_blocks f in
   let f = cleanup f in
