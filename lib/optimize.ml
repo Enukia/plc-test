@@ -772,6 +772,161 @@ let global_const_prop (prog: ir_program) : ir_program =
     | GlobalVar _ as g -> g)
     prog
 
+let split_at n xs =
+  let rec go n left rest =
+    if n <= 0 then List.rev left, rest
+    else
+      match rest with
+      | [] -> List.rev left, []
+      | x :: xs -> go (n - 1) (x :: left) xs
+  in
+  go n [] xs
+
+let const_eval_program (prog: ir_program) : ir_program =
+  let funcs =
+    List.filter_map (function Function f -> Some (f.fname, f) | GlobalVar _ -> None) prog
+  in
+  let globals =
+    List.fold_left (fun env -> function
+      | GlobalVar (name, Some v) -> ("V" ^ name, v) :: env
+      | GlobalVar (_, None) | Function _ -> env)
+      [] prog
+  in
+  let rec eval_func fuel depth fname args =
+    if fuel <= 0 || depth > 16 then None
+    else
+      match List.assoc_opt fname funcs with
+      | None -> None
+      | Some f ->
+          if List.length f.params <> List.length args then None
+          else
+          let instrs = Array.of_list (flatten_func f) in
+          let labels = Hashtbl.create 32 in
+          Array.iteri (fun i -> function Label l -> Hashtbl.replace labels l i | _ -> ()) instrs;
+          let env = ref globals in
+          List.iter2
+            (fun p v -> env := ("V" ^ p, v) :: List.remove_assoc ("V" ^ p) !env)
+            f.params args;
+          let args_stack = ref [] in
+          let get = function
+            | Const n -> Some n
+            | Temp t -> List.assoc_opt ("T" ^ string_of_int t) !env
+            | Var v -> List.assoc_opt ("V" ^ v) !env
+          in
+          let set o v =
+            match op_key o with
+            | Some k -> env := (k, v) :: List.remove_assoc k !env; true
+            | None -> false
+          in
+          let local_or_temp = function
+            | Temp _ -> true
+            | Var v -> List.mem v f.params || List.mem v f.locals
+            | Const _ -> false
+          in
+          let rec run fuel pc =
+            if fuel <= 0 || pc < 0 || pc >= Array.length instrs then None
+            else
+              match instrs.(pc) with
+              | Label _ -> run (fuel - 1) (pc + 1)
+              | Assign (d, s) ->
+                  if not (local_or_temp d) then None
+                  else (match get s with Some v when set d v -> run (fuel - 1) (pc + 1) | _ -> None)
+              | AssignBinOp (d, op, a, b) ->
+                  if not (local_or_temp d) then None
+                  else
+                    (match get a, get b with
+                     | Some x, Some y ->
+                         (match fold_binop op x y with
+                          | Some v when set d v -> run (fuel - 1) (pc + 1)
+                          | _ -> None)
+                     | _ -> None)
+              | AssignUnOp (d, op, a) ->
+                  if not (local_or_temp d) then None
+                  else
+                    (match get a with
+                     | Some x ->
+                         (match fold_unop op x with
+                          | Some v when set d v -> run (fuel - 1) (pc + 1)
+                          | _ -> None)
+                     | None -> None)
+              | Goto l ->
+                  (match Hashtbl.find_opt labels l with
+                   | Some target -> run (fuel - 1) target
+                   | None -> None)
+              | IfGoto (a, l) ->
+                  (match get a with
+                   | Some v when v <> 0 ->
+                       (match Hashtbl.find_opt labels l with
+                        | Some target -> run (fuel - 1) target
+                        | None -> None)
+                   | Some _ -> run (fuel - 1) (pc + 1)
+                   | None -> None)
+              | IfNotGoto (a, l) ->
+                  (match get a with
+                   | Some 0 ->
+                       (match Hashtbl.find_opt labels l with
+                        | Some target -> run (fuel - 1) target
+                        | None -> None)
+                   | Some _ -> run (fuel - 1) (pc + 1)
+                   | None -> None)
+              | Param a ->
+                  (match get a with
+                   | Some v -> args_stack := v :: !args_stack; run (fuel - 1) (pc + 1)
+                   | None -> None)
+              | Call (d, callee, nargs) ->
+                  if not (local_or_temp d) then None
+                  else
+                    let call_args, rem = split_at nargs !args_stack in
+                    args_stack := rem;
+                    if List.length call_args <> nargs then None
+                    else
+                      (match eval_func (fuel - 1) (depth + 1) callee call_args with
+                       | Some v when set d v -> run (fuel - 1) (pc + 1)
+                       | _ -> None)
+              | Return (Some a) -> get a
+              | Return None -> Some 0
+          in
+          (try run fuel 0 with Invalid_argument _ -> None)
+  in
+  let const_arg = function Const n -> Some n | _ -> None in
+  let fold_func f =
+    let rec go acc arg_stack = function
+      | [] ->
+          let pending = List.rev (List.map fst arg_stack) in
+          rebuild_func f (List.rev (List.fold_left (fun a i -> i :: a) acc pending))
+      | Param a :: rest ->
+          go acc ((Param a, const_arg a) :: arg_stack) rest
+      | Call (d, callee, nargs) :: rest ->
+          let call_args, rem = split_at nargs arg_stack in
+          let arg_vals = List.map snd call_args in
+          let can_fold =
+            List.length call_args = nargs
+            && List.for_all (function Some _ -> true | None -> false) arg_vals
+          in
+          if can_fold then
+            let vals = List.map (function Some v -> v | None -> assert false) arg_vals in
+            (match eval_func 5000000 0 callee vals with
+             | Some v -> go (Assign (d, Const v) :: acc) rem rest
+             | None ->
+                 let pending = List.rev (List.map fst call_args) in
+                 let acc = List.fold_left (fun a i -> i :: a) acc pending in
+                 go (Call (d, callee, nargs) :: acc) rem rest)
+          else
+            let pending = List.rev (List.map fst call_args) in
+            let acc = List.fold_left (fun a i -> i :: a) acc pending in
+            go (Call (d, callee, nargs) :: acc) rem rest
+      | i :: rest ->
+          let pending = List.rev (List.map fst arg_stack) in
+          let acc = List.fold_left (fun a p -> p :: a) acc pending in
+          go (i :: acc) [] rest
+    in
+    go [] [] (flatten_func f)
+  in
+  List.map (function
+    | Function f -> Function (fold_func f)
+    | GlobalVar _ as g -> g)
+    prog
+
 let optimize_linear instrs =
   instrs
   |> single_assign_const_prop
@@ -810,6 +965,13 @@ let optimize_func (f: ir_func) : ir_func =
 (* 对整个 IR 程序做优化：逐个函数处理，全局变量保持不变 *)
 let optimize_program (prog: ir_program) : ir_program =
   let prog = global_const_prop prog in
+  let prog =
+    List.map (function
+      | GlobalVar _ as g -> g
+      | Function f -> Function (optimize_func f))
+      prog
+  in
+  let prog = const_eval_program prog in
   List.map (function
     | GlobalVar _ as g -> g
     | Function f -> Function (optimize_func f)
