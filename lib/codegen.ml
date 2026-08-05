@@ -8,6 +8,16 @@ let gen_inline_label prefix =
   incr inline_label_counter;
   Printf.sprintf "%s_inline_%d" prefix !inline_label_counter
 
+let power_of_two_shift n =
+  if n <= 0 then None
+  else
+    let rec loop shift v =
+      if v = 1 then Some shift
+      else if v mod 2 <> 0 then None
+      else loop (shift + 1) (v / 2)
+    in
+    loop 0 n
+
 (* 辅助函数：列表切分 *)
 let rec split_at n = function
   | xs when n <= 0 -> [], xs
@@ -92,6 +102,37 @@ let emit_tac fname tac_inst map current_args =
       (match op with
        (* ================= 1. 乘法内联直接打印 ================= *)
        | Ast.Mul ->
+            let emit_const_mul dest nonconst c =
+              load_op "t0" nonconst map;
+              (match c with
+               | 0 -> Printf.printf "    li t2, 0\n"
+               | 1 -> Printf.printf "    addi t2, t0, 0\n"
+               | -1 -> Printf.printf "    sub t2, x0, t0\n"
+               | _ ->
+                   let sign = if c < 0 then -1 else 1 in
+                   let abs_c = if c < 0 then -c else c in
+                   (match power_of_two_shift abs_c with
+                    | Some sh ->
+                        Printf.printf "    slli t2, t0, %d\n" sh;
+                        if sign < 0 then Printf.printf "    sub t2, x0, t2\n"
+                    | None -> assert false));
+              store_op "t2" dest map
+            in
+            let const_mul =
+              match y, z with
+              | Const c, nonconst | nonconst, Const c ->
+                  (match c with
+                   | 0 | 1 | -1 -> Some (nonconst, c)
+                   | _ ->
+                       let abs_c = if c < 0 then -c else c in
+                       (match power_of_two_shift abs_c with
+                        | Some _ -> Some (nonconst, c)
+                        | None -> None))
+              | _ -> None
+            in
+            (match const_mul with
+             | Some (nonconst, c) -> emit_const_mul x nonconst c
+             | None ->
             let lbl_mul_pos1 = gen_inline_label ".L_mul_pos1" in
             let lbl_mul_pos2 = gen_inline_label ".L_mul_pos2" in
             let lbl_loop     = gen_inline_label ".L_mul_loop" in
@@ -137,6 +178,8 @@ let emit_tac fname tac_inst map current_args =
             store_op "t2" x map       (* 将计算结果 t2 写回目标操作数 *)
 
        (* ================= 2. 除法与取模内联直接打印 ================= *)
+            )
+
        | Ast.Div | Ast.Mod ->
            let lbl_start  = gen_inline_label ".L_divmod_start" in
            let lbl_n_pos  = gen_inline_label ".L_divmod_n_pos" in

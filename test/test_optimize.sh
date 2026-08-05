@@ -104,6 +104,48 @@ check "x*2 and x*0 avoid multiply helper" \
     'add t0, t0, t1' '\.L_mul_loop'
 
 echo ""
+echo "========== LOOP OPTIMIZATION =========="
+
+check "loop bound constant and x*2 simplified" \
+    'int main() { int n = 20; int i = 0; int s = 0; while (i < n) { s = s + i * 2; i = i + 1; } return s; }' \
+    'li t1, 20' '\.L_mul_loop'
+
+echo ""
+echo "========== BASIC COMBINED =========="
+
+check "combined const copy cse algebra dead code" \
+    'int f(int a, int b) { int scale = 4; int x = a * scale; int y = a * scale; int dead = b * b; return x + y + 0; } int main() { return f(3, 5); }' \
+    'slli' '\.L_mul_loop'
+
+echo ""
+echo "========== ADVANCED GRAPH =========="
+
+check "graph-style repeated global stride" \
+    'const int N = 8; int edge_score(int u, int v) { int a = u * N + v; int b = u * N + v; return a == b; } int main() { return edge_score(2, 3); }' \
+    'li a0, 1' '\.L_mul_loop'
+
+echo ""
+echo "========== ADVANCED MATRIX =========="
+
+check "matrix-style row-major index" \
+    'const int COLS = 16; int idx(int r, int c) { int a = r * COLS + c; int b = r * COLS + c; return a + b; } int main() { return idx(2, 3); }' \
+    'slli' '\.L_mul_loop'
+
+echo ""
+echo "========== GLOBAL CONST PROP =========="
+
+check "global const loaded as immediate" \
+    'const int LIMIT = 500; int main() { return LIMIT + 1; }' \
+    'li a0, 501' 'la .*LIMIT'
+
+echo ""
+echo "========== CONST EXPR CHAIN =========="
+
+check "global const expression chain collapsed" \
+    'const int A = 2; const int B = A * 3; const int C = B + 4; const int D = C * C; int main() { return D; }' \
+    'li a0, 100' '\.L_mul_loop'
+
+echo ""
 echo "========== TAIL RECURSION =========="
 
 TOTAL=$((TOTAL + 1))

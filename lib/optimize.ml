@@ -250,6 +250,55 @@ let common_subexpr (instrs: tac list) : tac list =
   ) instrs;
   List.rev !out
 
+let def_operand = function
+  | Assign (d, _) | AssignBinOp (d, _, _, _) | AssignUnOp (d, _, _)
+  | Call (d, _, _) -> Some d
+  | _ -> None
+
+let substitute_operands subst = function
+  | Assign (d, s) -> Assign (d, subst s)
+  | AssignBinOp (d, op, a, b) -> AssignBinOp (d, op, subst a, subst b)
+  | AssignUnOp (d, op, a) -> AssignUnOp (d, op, subst a)
+  | IfGoto (a, l) -> IfGoto (subst a, l)
+  | IfNotGoto (a, l) -> IfNotGoto (subst a, l)
+  | Param a -> Param (subst a)
+  | Return (Some a) -> Return (Some (subst a))
+  | i -> i
+
+(* Constants assigned exactly once are safe to substitute across labels.  This
+   covers loop bounds such as int n = 100; while (i < n) ... without needing
+   full data-flow analysis. *)
+let single_assign_const_prop (instrs: tac list) : tac list =
+  let defs = Hashtbl.create 32 in
+  let const_defs = Hashtbl.create 32 in
+  let bump k =
+    let old = match Hashtbl.find_opt defs k with Some n -> n | None -> 0 in
+    Hashtbl.replace defs k (old + 1)
+  in
+  List.iter (fun i ->
+    match def_operand i with
+    | Some d ->
+        (match op_key d with
+         | Some k ->
+             bump k;
+             (match i with
+              | Assign (_, Const n) -> Hashtbl.replace const_defs k n
+              | _ -> Hashtbl.remove const_defs k)
+         | None -> ())
+    | None -> ())
+    instrs;
+  let subst = function
+    | (Temp _ | Var _) as o ->
+        (match op_key o with
+         | Some k when Hashtbl.find_opt defs k = Some 1 ->
+             (match Hashtbl.find_opt const_defs k with
+              | Some n -> Const n
+              | None -> o)
+         | _ -> o)
+    | Const _ as c -> c
+  in
+  List.map (substitute_operands subst) instrs
+
 (* 常量折叠 + 基本块内常量传播 + 代数化简。
  * 每个 Label 处清空已知值（块间不做跨路径传播，保证安全）。 *)
 let const_fold (instrs: tac list) : tac list =
@@ -680,13 +729,58 @@ let shrink_func (f: ir_func) : ir_func =
 
 (* ---------- 主流程 ---------- *)
 
+let global_const_prop (prog: ir_program) : ir_program =
+  let globals =
+    List.fold_left (fun s -> function
+      | GlobalVar (name, _) -> S.add name s
+      | Function _ -> s)
+      S.empty prog
+  in
+  let candidates =
+    List.fold_left (fun env -> function
+      | GlobalVar (name, Some v) -> (name, v) :: env
+      | GlobalVar (_, None) | Function _ -> env)
+      [] prog
+  in
+  let assigned = ref S.empty in
+  let note_def = function
+    | Var v when S.mem v globals -> assigned := S.add v !assigned
+    | _ -> ()
+  in
+  List.iter (function
+    | Function f ->
+        List.iter
+          (fun i -> match def_operand i with Some d -> note_def d | None -> ())
+          (flatten_func f)
+    | GlobalVar _ -> ())
+    prog;
+  let env =
+    List.filter (fun (name, _) -> not (S.mem name !assigned)) candidates
+  in
+  let subst = function
+    | Var v ->
+        (match List.assoc_opt v env with
+         | Some n -> Const n
+         | None -> Var v)
+    | o -> o
+  in
+  let rewrite_func f =
+    rebuild_func f (List.map (substitute_operands subst) (flatten_func f))
+  in
+  List.map (function
+    | Function f -> Function (rewrite_func f)
+    | GlobalVar _ as g -> g)
+    prog
+
 let optimize_linear instrs =
   instrs
+  |> single_assign_const_prop
   |> const_fold
   |> algebra_simplify
   |> copy_prop
   |> common_subexpr
   |> copy_prop
+  |> single_assign_const_prop
   |> const_fold
   |> algebra_simplify
 
@@ -715,6 +809,7 @@ let optimize_func (f: ir_func) : ir_func =
 
 (* 对整个 IR 程序做优化：逐个函数处理，全局变量保持不变 *)
 let optimize_program (prog: ir_program) : ir_program =
+  let prog = global_const_prop prog in
   List.map (function
     | GlobalVar _ as g -> g
     | Function f -> Function (optimize_func f)
