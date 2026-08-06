@@ -26,16 +26,78 @@ let rec split_at n = function
       let prefix, suffix = split_at (n - 1) xs in
       x :: prefix, suffix
 
+let physical_regs =
+  [ "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11" ]
+
+let reg_of_operand reg_alloc op =
+  Hashtbl.find_opt reg_alloc op
+
+let local_operand_names f =
+  f.params @ f.locals
+
+let allocatable_operand f = function
+  | Temp _ -> true
+  | Var name -> List.mem name (local_operand_names f)
+  | Const _ -> false
+
+let iter_tac_uses f = function
+  | Assign (_, y) -> f y
+  | AssignBinOp (_, _, y, z) -> f y; f z
+  | AssignUnOp (_, _, y) -> f y
+  | IfGoto (x, _) | IfNotGoto (x, _) -> f x
+  | Param x -> f x
+  | Return (Some x) -> f x
+  | Call _ | Goto _ | Label _ | Return None -> ()
+
+let all_instrs (f: ir_func) =
+  f.entry.instrs @ List.concat_map (fun (b: basic_block) -> b.instrs) f.blocks
+
+let allocate_registers (f: ir_func) =
+  let counts = Hashtbl.create 32 in
+  let bump op =
+    if allocatable_operand f op then
+      let old = match Hashtbl.find_opt counts op with Some n -> n | None -> 0 in
+      Hashtbl.replace counts op (old + 1)
+  in
+  List.iter (iter_tac_uses bump) (all_instrs f);
+  let ranked =
+    Hashtbl.fold (fun op count acc -> (op, count) :: acc) counts []
+    |> List.filter (function
+         | Temp _, count -> count >= 3
+         | Var _, count -> count >= 2
+         | Const _, _ -> false)
+    |> List.sort (fun (a, ca) (b, cb) ->
+         let c = compare cb ca in
+         if c <> 0 then c else compare a b)
+  in
+  let reg_alloc = Hashtbl.create 16 in
+  let rec assign regs ranked =
+    match regs, ranked with
+    | reg :: regs', (op, _) :: rest ->
+        Hashtbl.replace reg_alloc op reg;
+        assign regs' rest
+    | [], _ | _, [] -> ()
+  in
+  assign physical_regs ranked;
+  reg_alloc
+
 (* 计算栈槽偏移量映射表 *)
-let compute_offsets (f: ir_func) =
+let compute_offsets (f: ir_func) reg_alloc saved_reg_count =
   let local_slots = ref 0 in
   let map = Hashtbl.create 32 in
+  let next_local_offset () =
+    incr local_slots;
+    -8 - (4 * saved_reg_count) - (4 * !local_slots)
+  in
   
   (* 处理函数参数 *)
   List.iteri (fun i name ->
-    if i < 8 then (
-      incr local_slots;
-      Hashtbl.add map (Var name) (-8 - 4 * !local_slots)
+    if reg_of_operand reg_alloc (Var name) <> None && i >= 8 then
+      Hashtbl.add map (Var name) ((i - 8) * 4)
+    else if reg_of_operand reg_alloc (Var name) <> None then
+      ()
+    else if i < 8 then (
+      Hashtbl.add map (Var name) (next_local_offset ())
     ) else (
       (* 大于 8 个的参数由 Caller 压栈，在旧 SP（即当前 FP）的正偏移处 *)
       Hashtbl.add map (Var name) ((i - 8) * 4)
@@ -44,66 +106,81 @@ let compute_offsets (f: ir_func) =
   
   (* 处理其它未映射的局部变量 *)
   List.iter (fun name ->
-    if not (Hashtbl.mem map (Var name)) then (
-      incr local_slots;
-      Hashtbl.add map (Var name) (-8 - 4 * !local_slots)
-    )
+    if reg_of_operand reg_alloc (Var name) = None
+       && not (Hashtbl.mem map (Var name)) then
+      Hashtbl.add map (Var name) (next_local_offset ())
   ) f.locals;
   
   (* 处理所有临时变量 *)
   for t = 0 to f.temps - 1 do
-    incr local_slots;
-    Hashtbl.add map (Temp t) (-8 - 4 * !local_slots)
+    if reg_of_operand reg_alloc (Temp t) = None then
+      Hashtbl.add map (Temp t) (next_local_offset ())
   done;
   
   (!local_slots, map)
 
 (* 将操作数的值加载到目标寄存器 *)
-let load_op reg op map =
+let load_op reg op map reg_alloc =
   match op with
   | Const n ->
       Printf.printf "    li %s, %d\n" reg n
   | Temp t ->
-      let off = Hashtbl.find map (Temp t) in
-      Printf.printf "    lw %s, %d(fp)\n" reg off
+      (match reg_of_operand reg_alloc (Temp t) with
+       | Some src when src <> reg -> Printf.printf "    mv %s, %s\n" reg src
+       | Some _ -> ()
+       | None ->
+           let off = Hashtbl.find map (Temp t) in
+           Printf.printf "    lw %s, %d(fp)\n" reg off)
   | Var name ->
-      if Hashtbl.mem map (Var name) then
-        let off = Hashtbl.find map (Var name) in
-        Printf.printf "    lw %s, %d(fp)\n" reg off
-      else
-        (* 找不到说明是全局变量 *)
-        (Printf.printf "    la %s, %s\n" reg name;
-         Printf.printf "    lw %s, 0(%s)\n" reg reg)
+      (match reg_of_operand reg_alloc (Var name) with
+       | Some src when src <> reg -> Printf.printf "    mv %s, %s\n" reg src
+       | Some _ -> ()
+       | None ->
+           if Hashtbl.mem map (Var name) then
+             let off = Hashtbl.find map (Var name) in
+             Printf.printf "    lw %s, %d(fp)\n" reg off
+           else
+             (* 找不到说明是全局变量 *)
+             (Printf.printf "    la %s, %s\n" reg name;
+              Printf.printf "    lw %s, 0(%s)\n" reg reg))
 
 (* 将寄存器中的值写回到操作数对应的栈槽中 *)
-let store_op reg op map =
+let store_op reg op map reg_alloc =
   match op with
   | Const _ -> () (* 常量不可作为左值 *)
   | Temp t ->
-      let off = Hashtbl.find map (Temp t) in
-      Printf.printf "    sw %s, %d(fp)\n" reg off
+      (match reg_of_operand reg_alloc (Temp t) with
+       | Some dst when dst <> reg -> Printf.printf "    mv %s, %s\n" dst reg
+       | Some _ -> ()
+       | None ->
+           let off = Hashtbl.find map (Temp t) in
+           Printf.printf "    sw %s, %d(fp)\n" reg off)
   | Var name ->
-      if Hashtbl.mem map (Var name) then
-        let off = Hashtbl.find map (Var name) in
-        Printf.printf "    sw %s, %d(fp)\n" reg off
-      else
-        (* 全局变量写回 *)
-        (Printf.printf "    la t3, %s\n" name;
-         Printf.printf "    sw %s, 0(t3)\n" reg)
+      (match reg_of_operand reg_alloc (Var name) with
+       | Some dst when dst <> reg -> Printf.printf "    mv %s, %s\n" dst reg
+       | Some _ -> ()
+       | None ->
+           if Hashtbl.mem map (Var name) then
+             let off = Hashtbl.find map (Var name) in
+             Printf.printf "    sw %s, %d(fp)\n" reg off
+           else
+             (* 全局变量写回 *)
+             (Printf.printf "    la t3, %s\n" name;
+              Printf.printf "    sw %s, 0(t3)\n" reg))
 
 (* 翻译单条 TAC 指令 *)
-let emit_tac fname tac_inst map current_args =
+let emit_tac fname tac_inst map reg_alloc current_args =
   match tac_inst with
   | Assign (x, y) ->
-      load_op "t0" y map;
-      store_op "t0" x map
+      load_op "t0" y map reg_alloc;
+      store_op "t0" x map reg_alloc
 
   | AssignBinOp (x, op, y, z) ->
       (match op with
        (* ================= 1. 乘法内联直接打印 ================= *)
        | Ast.Mul ->
             let emit_const_mul dest nonconst c =
-              load_op "t0" nonconst map;
+              load_op "t0" nonconst map reg_alloc;
               (match c with
                | 0 -> Printf.printf "    li t2, 0\n"
                | 1 -> Printf.printf "    addi t2, t0, 0\n"
@@ -116,7 +193,7 @@ let emit_tac fname tac_inst map current_args =
                         Printf.printf "    slli t2, t0, %d\n" sh;
                         if sign < 0 then Printf.printf "    sub t2, x0, t2\n"
                     | None -> assert false));
-              store_op "t2" dest map
+              store_op "t2" dest map reg_alloc
             in
             let const_mul =
               match y, z with
@@ -140,8 +217,8 @@ let emit_tac fname tac_inst map current_args =
             let lbl_end      = gen_inline_label ".L_mul_end" in
             let lbl_neg_result = gen_inline_label ".L_mul_neg_result" in
             
-            load_op "t0" y map;       (* t0 = 被乘数 *)
-            load_op "t1" z map;       (* t1 = 乘数 *)
+            load_op "t0" y map reg_alloc;       (* t0 = 被乘数 *)
+            load_op "t1" z map reg_alloc;       (* t1 = 乘数 *)
             
             (* RV32I 内联乘法开始 *)
             (* ----- 符号处理 ----- *)
@@ -175,7 +252,7 @@ let emit_tac fname tac_inst map current_args =
             Printf.printf "%s:\n" lbl_neg_result;
             (* RV32I 内联乘法结束 *)
             
-            store_op "t2" x map       (* 将计算结果 t2 写回目标操作数 *)
+            store_op "t2" x map reg_alloc       (* 将计算结果 t2 写回目标操作数 *)
 
        (* ================= 2. 除法与取模内联直接打印 ================= *)
             )
@@ -191,8 +268,8 @@ let emit_tac fname tac_inst map current_args =
            let lbl_r_pos  = gen_inline_label ".L_divmod_r_pos" in
            let lbl_finish = gen_inline_label ".L_divmod_finish" in
            
-           load_op "t0" y map;       (* t0 = 被除数 N *)
-           load_op "t1" z map;       (* t1 = 除数 D *)
+           load_op "t0" y map reg_alloc;       (* t0 = 被除数 N *)
+           load_op "t1" z map reg_alloc;       (* t1 = 除数 D *)
            
            (* RV32I 内联除法/取模开始 *)
            (* 除 0 保护检查 *)
@@ -254,14 +331,14 @@ let emit_tac fname tac_inst map current_args =
            
            (* 根据 TAC 操作码，决定把“商”还是“余数”写回内存 *)
            if op = Ast.Div then
-             store_op "t2" x map                    (* t2 存的是商 *)
+             store_op "t2" x map reg_alloc                    (* t2 存的是商 *)
            else
-             store_op "t3" x map                    (* t3 存的是余数 *)
+             store_op "t3" x map reg_alloc                    (* t3 存的是余数 *)
 
        (* ================= 3. RV32I 原生支持的标准有符号/逻辑运算 ================= *)
        | _ ->
-           load_op "t0" y map;
-           load_op "t1" z map;
+           load_op "t0" y map reg_alloc;
+           load_op "t1" z map reg_alloc;
            (match op with
             | Ast.Add -> Printf.printf "    add t0, t0, t1\n"
             | Ast.Sub -> Printf.printf "    sub t0, t0, t1\n"
@@ -275,13 +352,13 @@ let emit_tac fname tac_inst map current_args =
             | Ast.Or  -> Printf.printf "    or t0, t0, t1\n"
             | Ast.Mul | Ast.Div | Ast.Mod -> assert false (* 已在外部 match 处理 *)
            );
-           store_op "t0" x map)
+           store_op "t0" x map reg_alloc)
 
   (* 支持M扩展时启用 *)
   (*
   | AssignBinOp (x, op, y, z) ->
-      load_op "t0" y map;
-      load_op "t1" z map;
+      load_op "t0" y map reg_alloc;
+      load_op "t1" z map reg_alloc;
       (match op with
        | Ast.Add -> Printf.printf "    add t0, t0, t1\n"
        | Ast.Sub -> Printf.printf "    sub t0, t0, t1\n"
@@ -296,26 +373,26 @@ let emit_tac fname tac_inst map current_args =
        | Ast.Ge  -> Printf.printf "    slt t0, t0, t1\n    xori t0, t0, 1\n"
        | Ast.And -> Printf.printf "    and t0, t0, t1\n"
        | Ast.Or  -> Printf.printf "    or t0, t0, t1\n");
-      store_op "t0" x map
+      store_op "t0" x map reg_alloc
   *)
 
   | AssignUnOp (x, op, y) ->
-      load_op "t0" y map;
+      load_op "t0" y map reg_alloc;
       (match op with
        | Ast.Pos -> ()
        | Ast.Neg -> Printf.printf "    neg t0, t0\n"
        | Ast.Not -> Printf.printf "    seqz t0, t0\n");
-      store_op "t0" x map
+      store_op "t0" x map reg_alloc
 
   | Goto l ->
       Printf.printf "    j %s\n" l
 
   | IfGoto (x, l) ->
-      load_op "t0" x map;
+      load_op "t0" x map reg_alloc;
       Printf.printf "    bnez t0, %s\n" l
 
   | IfNotGoto (x, l) ->
-      load_op "t0" x map;
+      load_op "t0" x map reg_alloc;
       Printf.printf "    beqz t0, %s\n" l
 
   | Label l ->
@@ -339,9 +416,9 @@ let emit_tac fname tac_inst map current_args =
       (* 传递参数 *)
       List.iteri (fun j arg ->
         if j < 8 then
-          load_op (Printf.sprintf "a%d" j) arg map
+          load_op (Printf.sprintf "a%d" j) arg map reg_alloc
         else
-          (load_op "t0" arg map;
+          (load_op "t0" arg map reg_alloc;
            Printf.printf "    sw t0, %d(sp)\n" ((j - 8) * 4))
       ) args;
       
@@ -353,25 +430,33 @@ let emit_tac fname tac_inst map current_args =
         Printf.printf "    addi sp, sp, %d\n" extra_space;
         
       (* 保存返回值 *)
-      store_op "a0" dest map
+      store_op "a0" dest map reg_alloc
 
   | Return (Some x) ->
-      load_op "a0" x map;
+      load_op "a0" x map reg_alloc;
       Printf.printf "    j .L_epilogue_%s\n" fname
 
   | Return None ->
       Printf.printf "    j .L_epilogue_%s\n" fname
 
 (* 翻译单个基本块 *)
-let emit_block fname (b: basic_block) map current_args =
+let emit_block fname (b: basic_block) map reg_alloc current_args =
   Printf.printf "%s:\n" b.label;
-  List.iter (fun inst -> emit_tac fname inst map current_args) b.instrs
+  List.iter (fun inst -> emit_tac fname inst map reg_alloc current_args) b.instrs
 
 (* 翻译单个函数 *)
 let emit_function (f: ir_func) =
-  let slots, map = compute_offsets f in
+  let reg_alloc = allocate_registers f in
+  let used_regs =
+    List.filter
+      (fun reg ->
+        Hashtbl.fold (fun _ r found -> found || r = reg) reg_alloc false)
+      physical_regs
+  in
+  let saved_reg_count = List.length used_regs in
+  let slots, map = compute_offsets f reg_alloc saved_reg_count in
   (* 计算对齐 16 字节后的帧大小（8 字节用于保存 ra 和 fp） *)
-  let framesize = ((8 + slots * 4 + 15) / 16) * 16 in
+  let framesize = ((8 + saved_reg_count * 4 + slots * 4 + 15) / 16) * 16 in
   
   Printf.printf "    .globl %s\n" f.fname;
   Printf.printf "%s:\n" f.fname;
@@ -380,13 +465,23 @@ let emit_function (f: ir_func) =
   Printf.printf "    addi sp, sp, -%d\n" framesize;
   Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
   Printf.printf "    sw fp, %d(sp)\n" (framesize - 8);
+  List.iteri
+    (fun i reg -> Printf.printf "    sw %s, %d(sp)\n" reg (framesize - 12 - (4 * i)))
+    used_regs;
   Printf.printf "    addi fp, sp, %d\n" framesize;
   
   (* 将传进来的前 8 个参数从寄存器转存到本地分配的栈槽 *)
   List.iteri (fun i name ->
-    if i < 8 then
-      let off = Hashtbl.find map (Var name) in
-      Printf.printf "    sw a%d, %d(fp)\n" i off
+    match reg_of_operand reg_alloc (Var name) with
+    | Some reg when i < 8 ->
+        Printf.printf "    mv %s, a%d\n" reg i
+    | Some reg ->
+        let off = Hashtbl.find map (Var name) in
+        Printf.printf "    lw %s, %d(fp)\n" reg off
+    | None when i < 8 ->
+        let off = Hashtbl.find map (Var name) in
+        Printf.printf "    sw a%d, %d(fp)\n" i off
+    | None -> ()
   ) f.params;
 
   (* 打印函数入口标签：尾递归优化会跳回该标签。
@@ -396,11 +491,14 @@ let emit_function (f: ir_func) =
   
   (* 函数体翻译 (Body) *)
   let current_args = ref [] in
-  List.iter (fun inst -> emit_tac f.fname inst map current_args) f.entry.instrs;
-  List.iter (fun b -> emit_block f.fname b map current_args) f.blocks;
+  List.iter (fun inst -> emit_tac f.fname inst map reg_alloc current_args) f.entry.instrs;
+  List.iter (fun b -> emit_block f.fname b map reg_alloc current_args) f.blocks;
   
   (* 函数结语 (Epilogue) *)
   Printf.printf ".L_epilogue_%s:\n" f.fname;
+  List.iteri
+    (fun i reg -> Printf.printf "    lw %s, %d(fp)\n" reg (-12 - (4 * i)))
+    used_regs;
   Printf.printf "    lw ra, -4(fp)\n";
   Printf.printf "    lw fp, -8(fp)\n";
   Printf.printf "    addi sp, sp, %d\n" framesize;
