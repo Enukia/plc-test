@@ -20,6 +20,7 @@
 open Ir
 
 module S = Set.Make(String)
+module M = Map.Make(String)
 
 (* ---------- 通用工具 ---------- *)
 
@@ -526,6 +527,145 @@ let block_succs (all: basic_block list) : int list list =
     in
     if terminated then ts else ts @ next) all
 
+let const_prop_cfg (f: ir_func) : ir_func =
+  let all = f.entry :: f.blocks in
+  let n = List.length all in
+  if n = 0 then f
+  else
+    let succs = Array.of_list (block_succs all) in
+    let preds = Array.make n [] in
+    Array.iteri
+      (fun i js ->
+        List.iter
+          (fun j ->
+            if j >= 0 && j < n then preds.(j) <- i :: preds.(j))
+          js)
+      succs;
+    let tracked = function
+      | Temp _ -> true
+      | Var v -> List.mem v f.params || List.mem v f.locals
+      | Const _ -> false
+    in
+    let env_find o env =
+      match op_key o with
+      | Some k -> M.find_opt k env
+      | None -> None
+    in
+    let subst env = function
+      | Const _ as c -> c
+      | (Temp _ | Var _) as o ->
+          (match env_find o env with Some n -> Const n | None -> o)
+    in
+    let env_set d v env =
+      match op_key d with
+      | Some k when tracked d -> M.add k v env
+      | _ -> env
+    in
+    let env_drop d env =
+      match op_key d with
+      | Some k when tracked d -> M.remove k env
+      | _ -> env
+    in
+    let meet envs =
+      match envs with
+      | [] -> M.empty
+      | first :: rest ->
+          M.filter
+            (fun k v -> List.for_all (fun e -> M.find_opt k e = Some v) rest)
+            first
+    in
+    let transfer env instrs =
+      let env = ref env in
+      let out = ref [] in
+      let emit i = out := i :: !out in
+      let def_const d v =
+        env := env_set d v !env;
+        emit (Assign (d, Const v))
+      in
+      List.iter
+        (fun inst ->
+          match inst with
+          | Assign (d, s) ->
+              let s' = subst !env s in
+              (match s' with
+               | Const n -> def_const d n
+               | _ ->
+                   env := env_drop d !env;
+                   if d <> s' then emit (Assign (d, s')))
+          | AssignBinOp (d, op, a, b) ->
+              let a' = subst !env a and b' = subst !env b in
+              (match a', b' with
+               | Const x, Const y ->
+                   (match fold_binop op x y with
+                    | Some v -> def_const d v
+                    | None ->
+                        env := env_drop d !env;
+                        emit (AssignBinOp (d, op, a', b')))
+               | _ ->
+                   env := env_drop d !env;
+                   emit (AssignBinOp (d, op, a', b')))
+          | AssignUnOp (d, op, a) ->
+              let a' = subst !env a in
+              (match a' with
+               | Const x ->
+                   (match fold_unop op x with
+                    | Some v -> def_const d v
+                    | None ->
+                        env := env_drop d !env;
+                        emit (AssignUnOp (d, op, a')))
+               | _ ->
+                   env := env_drop d !env;
+                   emit (AssignUnOp (d, op, a')))
+          | IfGoto (a, l) ->
+              (match subst !env a with
+               | Const n -> if n <> 0 then emit (Goto l)
+               | a' -> emit (IfGoto (a', l)))
+          | IfNotGoto (a, l) ->
+              (match subst !env a with
+               | Const n -> if n = 0 then emit (Goto l)
+               | a' -> emit (IfNotGoto (a', l)))
+          | Param a ->
+              emit (Param (subst !env a))
+          | Call (d, callee, nargs) ->
+              env := env_drop d !env;
+              emit (Call (d, callee, nargs))
+          | Return (Some a) ->
+              emit (Return (Some (subst !env a)))
+          | Goto _ | Label _ | Return None ->
+              emit inst)
+        instrs;
+      !env, List.rev !out
+    in
+    let in_env = Array.make n M.empty in
+    let out_env = Array.make n M.empty in
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      for i = 0 to n - 1 do
+        let input =
+          if i = 0 then M.empty
+          else meet (List.map (fun p -> out_env.(p)) preds.(i))
+        in
+        if not (M.equal (=) input in_env.(i)) then (
+          in_env.(i) <- input;
+          changed := true);
+        let output, _ = transfer input (List.nth all i).instrs in
+        if not (M.equal (=) output out_env.(i)) then (
+          out_env.(i) <- output;
+          changed := true)
+      done
+    done;
+    let rewritten =
+      List.mapi
+        (fun i (b: basic_block) ->
+          let _, instrs = transfer in_env.(i) b.instrs in
+          { b with instrs })
+        all
+    in
+    match rewritten with
+    | entry :: blocks -> { f with entry; blocks }
+    | [] -> f
+
 (* 删除从入口不可达的基本块 *)
 let remove_unreachable_blocks (f: ir_func) : ir_func =
   let all = f.entry :: f.blocks in
@@ -664,15 +804,56 @@ let dce (f: ir_func) : ir_func =
 (* 消除跳转到下一个基本块的冗余 Goto *)
 let cleanup (f: ir_func) : ir_func =
   let all = f.entry :: f.blocks in
+  let aliases = Hashtbl.create 16 in
+  List.iter
+    (fun (b: basic_block) ->
+      match b.instrs with
+      | [Goto l] -> Hashtbl.replace aliases b.label l
+      | _ -> ())
+    all;
+  let rec resolve seen l =
+    if List.mem l seen then l
+    else
+      match Hashtbl.find_opt aliases l with
+      | Some l' -> resolve (l :: seen) l'
+      | None -> l
+  in
+  let rewrite_label l = resolve [] l in
+  let rewrite_jumps (b: basic_block) =
+    let instrs =
+      List.map
+        (function
+          | Goto l -> Goto (rewrite_label l)
+          | IfGoto (o, l) -> IfGoto (o, rewrite_label l)
+          | IfNotGoto (o, l) -> IfNotGoto (o, rewrite_label l)
+          | i -> i)
+        b.instrs
+    in
+    { b with instrs }
+  in
+  let all = List.map rewrite_jumps all in
+  let simplify_fallthrough next_label (b: basic_block) =
+    let instrs =
+      match List.rev b.instrs with
+      | Goto l :: rest when l = next_label ->
+          List.rev rest
+      | IfGoto (_, l) :: rest when l = next_label ->
+          List.rev rest
+      | IfNotGoto (_, l) :: rest when l = next_label ->
+          List.rev rest
+      | Goto g :: IfGoto (cond, l) :: rest when l = next_label ->
+          List.rev (IfNotGoto (cond, g) :: rest)
+      | Goto g :: IfNotGoto (cond, l) :: rest when l = next_label ->
+          List.rev (IfGoto (cond, g) :: rest)
+      | _ -> b.instrs
+    in
+    { b with instrs }
+  in
   let rec go acc = function
     | [] -> List.rev acc
     | [b] -> List.rev (b :: acc)
     | (b1: basic_block) :: (((b2: basic_block) :: _) as rest) ->
-        let b1' =
-          match List.rev b1.instrs with
-          | (Goto l) :: tl when l = b2.label -> { b1 with instrs = List.rev tl }
-          | _ -> b1
-        in
+        let b1' = simplify_fallthrough b2.label b1 in
         go (b1' :: acc) rest
   in
   match go [] all with
@@ -954,11 +1135,16 @@ let optimize_func (f: ir_func) : ir_func =
   let f = rebuild_func f instrs in
   let f = truncate_func f in
   let f = remove_unreachable_blocks f in
+  let f = const_prop_cfg f in
+  let f = rebuild_func f (repeat_linear 2 (flatten_func f)) in
+  let f = truncate_func f in
+  let f = remove_unreachable_blocks f in
   let f = dce f in
   let f = rebuild_func f (repeat_linear 2 (flatten_func f)) in
   let f = dce f in
   let f = merge_empty_blocks f in
   let f = cleanup f in
+  let f = remove_unreachable_blocks f in
   let f = shrink_func f in
   f
 

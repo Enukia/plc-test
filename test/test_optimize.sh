@@ -56,6 +56,14 @@ check "constant branch selects dead path away" \
     'int main() { if (2 > 1) return 10; else return 20; }' \
     'li a0, 10' 'li a0, 20'
 
+check "cross-block equal constants fold after join" \
+    'int f(int c) { int x = 0; if (c) { x = 4; } else { x = 4; } return x + 3; } int main() { return f(0); }' \
+    'li a0, 7' 'lw a0'
+
+check "loop predecessor constant reaches body return" \
+    'int main() { int x = 7; int y = 0; while (y < 1) { return x + 2; } return x + 3; }' \
+    'li a0, 9' 'lw a0'
+
 echo ""
 echo "========== DEAD CODE ELIMINATION =========="
 
