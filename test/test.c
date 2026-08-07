@@ -1,9 +1,1 @@
-void foo() {
-    int x = 1;
-    int y = x + 2;
-}
-
-int main() {
-    return 1;
-    foo();
-}
+int fib(int n) { if (n <= 1) return n; return fib(n - 1) + fib(n - 2); } int main() { return fib(10); }

@@ -26,8 +26,11 @@ let rec split_at n = function
       let prefix, suffix = split_at (n - 1) xs in
       x :: prefix, suffix
 
-let physical_regs =
+let callee_saved_regs =
   [ "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11" ]
+
+let leaf_regs =
+  [ "a3"; "a4"; "a5"; "a6"; "a7" ]
 
 let reg_of_operand reg_alloc op =
   Hashtbl.find_opt reg_alloc op
@@ -52,7 +55,37 @@ let iter_tac_uses f = function
 let all_instrs (f: ir_func) =
   f.entry.instrs @ List.concat_map (fun (b: basic_block) -> b.instrs) f.blocks
 
-let allocate_registers (f: ir_func) =
+let has_call (f: ir_func) =
+  List.exists (function Call _ -> true | _ -> false) (all_instrs f)
+
+let iter_tac_defs f = function
+  | Assign (x, _) | AssignBinOp (x, _, _, _) | AssignUnOp (x, _, _)
+  | Call (x, _, _) -> f x
+  | Goto _ | IfGoto _ | IfNotGoto _ | Label _ | Param _ | Return _ -> ()
+
+let live_across_calls (f: ir_func) =
+  let live = Hashtbl.create 32 in
+  let across = Hashtbl.create 32 in
+  let add_live op =
+    if allocatable_operand f op then Hashtbl.replace live op ()
+  in
+  let remove_live op =
+    if allocatable_operand f op then Hashtbl.remove live op
+  in
+  List.iter
+    (fun inst ->
+      (match inst with
+       | Call _ ->
+           iter_tac_defs remove_live inst;
+           Hashtbl.iter (fun op () -> Hashtbl.replace across op ()) live;
+           iter_tac_uses add_live inst
+       | _ ->
+           iter_tac_defs remove_live inst;
+           iter_tac_uses add_live inst))
+    (List.rev (all_instrs f));
+  across
+
+let operand_use_counts (f: ir_func) =
   let counts = Hashtbl.create 32 in
   let bump op =
     if allocatable_operand f op then
@@ -60,9 +93,16 @@ let allocate_registers (f: ir_func) =
       Hashtbl.replace counts op (old + 1)
   in
   List.iter (iter_tac_uses bump) (all_instrs f);
+  counts
+
+let allocate_registers (f: ir_func) =
+  let counts = operand_use_counts f in
+  let leaf = not (has_call f) in
+  let live_across = live_across_calls f in
   let ranked =
     Hashtbl.fold (fun op count acc -> (op, count) :: acc) counts []
     |> List.filter (function
+         | op, count when (not leaf) && Hashtbl.mem live_across op -> count >= 1
          | Temp _, count -> count >= 3
          | Var _, count -> count >= 2
          | Const _, _ -> false)
@@ -78,7 +118,18 @@ let allocate_registers (f: ir_func) =
         assign regs' rest
     | [], _ | _, [] -> ()
   in
-  assign physical_regs ranked;
+  (if leaf then
+    let caller_ranked =
+      List.filter
+        (function Var name, _ -> not (List.mem name f.params) | Temp _, _ -> true | Const _, _ -> false)
+        ranked
+    in
+    assign leaf_regs caller_ranked
+  else
+    let callee_ranked =
+      List.filter (fun (op, _) -> Hashtbl.mem live_across op) ranked
+    in
+    assign callee_saved_regs callee_ranked);
   reg_alloc
 
 (* 计算栈槽偏移量映射表 *)
@@ -165,15 +216,97 @@ let store_op reg op map reg_alloc =
              Printf.printf "    sw %s, %d(fp)\n" reg off
            else
              (* 全局变量写回 *)
-             (Printf.printf "    la t3, %s\n" name;
-              Printf.printf "    sw %s, 0(t3)\n" reg))
+              (Printf.printf "    la t3, %s\n" name;
+               Printf.printf "    sw %s, 0(t3)\n" reg))
+
+let op_in_reg op reg_alloc reg =
+  match reg_of_operand reg_alloc op with
+  | Some r -> r = reg
+  | None -> false
+
+let native_commutative = Ast.(function
+  | Add | Eq | Ne | And | Or -> true
+  | Sub | Mul | Div | Mod | Lt | Gt | Le | Ge -> false)
+
+let result_reg_for dst right reg_alloc =
+  match reg_of_operand reg_alloc dst with
+  | Some reg when not (op_in_reg right reg_alloc reg) -> reg
+  | _ -> "t0"
+
+let emit_assign dst src map reg_alloc =
+  match reg_of_operand reg_alloc dst with
+  | Some reg -> load_op reg src map reg_alloc
+  | None ->
+      load_op "t0" src map reg_alloc;
+      store_op "t0" dst map reg_alloc
+
+let emit_unop dst op src map reg_alloc =
+  let out_reg =
+    match reg_of_operand reg_alloc dst with
+    | Some reg -> reg
+    | None -> "t0"
+  in
+  load_op out_reg src map reg_alloc;
+  (match op with
+   | Ast.Pos -> ()
+   | Ast.Neg -> Printf.printf "    neg %s, %s\n" out_reg out_reg
+   | Ast.Not -> Printf.printf "    seqz %s, %s\n" out_reg out_reg);
+  store_op out_reg dst map reg_alloc
+
+let comparison_op = Ast.(function
+  | Eq | Ne | Lt | Gt | Le | Ge -> true
+  | Add | Sub | Mul | Div | Mod | And | Or -> false)
+
+let emit_compare_branch branch_when_true op left right label map reg_alloc =
+  load_op "t0" left map reg_alloc;
+  load_op "t1" right map reg_alloc;
+  let emit instr a b =
+    Printf.printf "    %s %s, %s, %s\n" instr a b label
+  in
+  match branch_when_true, op with
+  | true, Ast.Eq -> emit "beq" "t0" "t1"
+  | true, Ast.Ne -> emit "bne" "t0" "t1"
+  | true, Ast.Lt -> emit "blt" "t0" "t1"
+  | true, Ast.Gt -> emit "blt" "t1" "t0"
+  | true, Ast.Le -> emit "bge" "t1" "t0"
+  | true, Ast.Ge -> emit "bge" "t0" "t1"
+  | false, Ast.Eq -> emit "bne" "t0" "t1"
+  | false, Ast.Ne -> emit "beq" "t0" "t1"
+  | false, Ast.Lt -> emit "bge" "t0" "t1"
+  | false, Ast.Gt -> emit "bge" "t1" "t0"
+  | false, Ast.Le -> emit "blt" "t1" "t0"
+  | false, Ast.Ge -> emit "blt" "t0" "t1"
+  | _, (Ast.Add | Ast.Sub | Ast.Mul | Ast.Div | Ast.Mod | Ast.And | Ast.Or) ->
+      assert false
+
+let emit_native_binop dst op left right map reg_alloc =
+  let left, right =
+    match reg_of_operand reg_alloc dst with
+    | Some reg when native_commutative op && op_in_reg right reg_alloc reg -> right, left
+    | _ -> left, right
+  in
+  let out_reg = result_reg_for dst right reg_alloc in
+  load_op out_reg left map reg_alloc;
+  load_op "t1" right map reg_alloc;
+  (match op with
+   | Ast.Add -> Printf.printf "    add %s, %s, t1\n" out_reg out_reg
+   | Ast.Sub -> Printf.printf "    sub %s, %s, t1\n" out_reg out_reg
+   | Ast.Eq  -> Printf.printf "    sub %s, %s, t1\n    sltiu %s, %s, 1\n" out_reg out_reg out_reg out_reg
+   | Ast.Ne  -> Printf.printf "    sub %s, %s, t1\n    sltu %s, zero, %s\n" out_reg out_reg out_reg out_reg
+   | Ast.Lt  -> Printf.printf "    slt %s, %s, t1\n" out_reg out_reg
+   | Ast.Gt  -> Printf.printf "    slt %s, t1, %s\n" out_reg out_reg
+   | Ast.Le  -> Printf.printf "    slt %s, t1, %s\n    xori %s, %s, 1\n" out_reg out_reg out_reg out_reg
+   | Ast.Ge  -> Printf.printf "    slt %s, %s, t1\n    xori %s, %s, 1\n" out_reg out_reg out_reg out_reg
+   | Ast.And -> Printf.printf "    and %s, %s, t1\n" out_reg out_reg
+   | Ast.Or  -> Printf.printf "    or %s, %s, t1\n" out_reg out_reg
+   | Ast.Mul | Ast.Div | Ast.Mod -> assert false);
+  store_op out_reg dst map reg_alloc
 
 (* 翻译单条 TAC 指令 *)
 let emit_tac fname tac_inst map reg_alloc current_args =
   match tac_inst with
   | Assign (x, y) ->
-      load_op "t0" y map reg_alloc;
-      store_op "t0" x map reg_alloc
+      emit_assign x y map reg_alloc
 
   | AssignBinOp (x, op, y, z) ->
       (match op with
@@ -337,22 +470,7 @@ let emit_tac fname tac_inst map reg_alloc current_args =
 
        (* ================= 3. RV32I 原生支持的标准有符号/逻辑运算 ================= *)
        | _ ->
-           load_op "t0" y map reg_alloc;
-           load_op "t1" z map reg_alloc;
-           (match op with
-            | Ast.Add -> Printf.printf "    add t0, t0, t1\n"
-            | Ast.Sub -> Printf.printf "    sub t0, t0, t1\n"
-            | Ast.Eq  -> Printf.printf "    sub t0, t0, t1\n    sltiu t0, t0, 1\n"
-            | Ast.Ne  -> Printf.printf "    sub t0, t0, t1\n    sltu t0, zero, t0\n"
-            | Ast.Lt  -> Printf.printf "    slt t0, t0, t1\n"
-            | Ast.Gt  -> Printf.printf "    slt t0, t1, t0\n"
-            | Ast.Le  -> Printf.printf "    slt t0, t1, t0\n    xori t0, t0, 1\n"
-            | Ast.Ge  -> Printf.printf "    slt t0, t0, t1\n    xori t0, t0, 1\n"
-            | Ast.And -> Printf.printf "    and t0, t0, t1\n"
-            | Ast.Or  -> Printf.printf "    or t0, t0, t1\n"
-            | Ast.Mul | Ast.Div | Ast.Mod -> assert false (* 已在外部 match 处理 *)
-           );
-           store_op "t0" x map reg_alloc)
+           emit_native_binop x op y z map reg_alloc)
 
   (* 支持M扩展时启用 *)
   (*
@@ -377,12 +495,7 @@ let emit_tac fname tac_inst map reg_alloc current_args =
   *)
 
   | AssignUnOp (x, op, y) ->
-      load_op "t0" y map reg_alloc;
-      (match op with
-       | Ast.Pos -> ()
-       | Ast.Neg -> Printf.printf "    neg t0, t0\n"
-       | Ast.Not -> Printf.printf "    seqz t0, t0\n");
-      store_op "t0" x map reg_alloc
+      emit_unop x op y map reg_alloc
 
   | Goto l ->
       Printf.printf "    j %s\n" l
@@ -439,19 +552,63 @@ let emit_tac fname tac_inst map reg_alloc current_args =
   | Return None ->
       Printf.printf "    j .L_epilogue_%s\n" fname
 
+let used_once use_counts op =
+  Hashtbl.find_opt use_counts op = Some 1
+
+let rec emit_instrs fname instrs map reg_alloc use_counts current_args =
+  match instrs with
+  | AssignBinOp (Temp t, op, left, right) :: IfGoto (Temp t', label) :: rest
+    when t = t' && used_once use_counts (Temp t) && comparison_op op ->
+      emit_compare_branch true op left right label map reg_alloc;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | AssignBinOp (Temp t, op, left, right) :: IfNotGoto (Temp t', label) :: rest
+    when t = t' && used_once use_counts (Temp t) && comparison_op op ->
+      emit_compare_branch false op left right label map reg_alloc;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | Assign (Temp t, src) :: IfGoto (Temp t', label) :: rest
+    when t = t' && used_once use_counts (Temp t) ->
+      emit_tac fname (IfGoto (src, label)) map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | Assign (Temp t, src) :: IfNotGoto (Temp t', label) :: rest
+    when t = t' && used_once use_counts (Temp t) ->
+      emit_tac fname (IfNotGoto (src, label)) map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | Assign (Temp t, src) :: Assign (dst, Temp t') :: rest
+    when t = t' && used_once use_counts (Temp t) ->
+      emit_tac fname (Assign (dst, src)) map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | AssignBinOp (Temp t, op, left, right) :: Assign (dst, Temp t') :: rest
+    when t = t' && used_once use_counts (Temp t) ->
+      emit_tac fname (AssignBinOp (dst, op, left, right)) map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | AssignUnOp (Temp t, op, src) :: Assign (dst, Temp t') :: rest
+    when t = t' && used_once use_counts (Temp t) ->
+      emit_tac fname (AssignUnOp (dst, op, src)) map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | Call (Temp t, callee, nargs) :: Assign (dst, Temp t') :: rest
+    when t = t' && used_once use_counts (Temp t) ->
+      emit_tac fname (Call (dst, callee, nargs)) map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | inst :: rest ->
+      emit_tac fname inst map reg_alloc current_args;
+      emit_instrs fname rest map reg_alloc use_counts current_args
+  | [] -> ()
+
 (* 翻译单个基本块 *)
-let emit_block fname (b: basic_block) map reg_alloc current_args =
+let emit_block fname (b: basic_block) map reg_alloc use_counts current_args =
   Printf.printf "%s:\n" b.label;
-  List.iter (fun inst -> emit_tac fname inst map reg_alloc current_args) b.instrs
+  emit_instrs fname b.instrs map reg_alloc use_counts current_args
 
 (* 翻译单个函数 *)
 let emit_function (f: ir_func) =
+  let use_counts = operand_use_counts f in
+  let leaf = not (has_call f) in
   let reg_alloc = allocate_registers f in
   let used_regs =
     List.filter
       (fun reg ->
         Hashtbl.fold (fun _ r found -> found || r = reg) reg_alloc false)
-      physical_regs
+      callee_saved_regs
   in
   let saved_reg_count = List.length used_regs in
   let slots, map = compute_offsets f reg_alloc saved_reg_count in
@@ -463,7 +620,8 @@ let emit_function (f: ir_func) =
   
   (* 函数序言 (Prologue) *)
   Printf.printf "    addi sp, sp, -%d\n" framesize;
-  Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
+  if not leaf then
+    Printf.printf "    sw ra, %d(sp)\n" (framesize - 4);
   Printf.printf "    sw fp, %d(sp)\n" (framesize - 8);
   List.iteri
     (fun i reg -> Printf.printf "    sw %s, %d(sp)\n" reg (framesize - 12 - (4 * i)))
@@ -491,15 +649,16 @@ let emit_function (f: ir_func) =
   
   (* 函数体翻译 (Body) *)
   let current_args = ref [] in
-  List.iter (fun inst -> emit_tac f.fname inst map reg_alloc current_args) f.entry.instrs;
-  List.iter (fun b -> emit_block f.fname b map reg_alloc current_args) f.blocks;
+  emit_instrs f.fname f.entry.instrs map reg_alloc use_counts current_args;
+  List.iter (fun b -> emit_block f.fname b map reg_alloc use_counts current_args) f.blocks;
   
   (* 函数结语 (Epilogue) *)
   Printf.printf ".L_epilogue_%s:\n" f.fname;
   List.iteri
     (fun i reg -> Printf.printf "    lw %s, %d(fp)\n" reg (-12 - (4 * i)))
     used_regs;
-  Printf.printf "    lw ra, -4(fp)\n";
+  if not leaf then
+    Printf.printf "    lw ra, -4(fp)\n";
   Printf.printf "    lw fp, -8(fp)\n";
   Printf.printf "    addi sp, sp, %d\n" framesize;
   Printf.printf "    ret\n\n"
